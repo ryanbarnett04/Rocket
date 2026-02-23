@@ -2,20 +2,28 @@
 
 using namespace clang;
 using namespace clang::tooling;
-int violations = 0;
 
+struct ProgramInfo {
+    std::vector<FunctionDecl*> FunctionStack;
+    int FunctionCount = 0;
+    int AssertionCount = 0;
+    int Violations = 0;
+    int DereferenceCount = 0;
+    bool MultipleDereference = false;
+};
 
 class TreeVisitor : public RecursiveASTVisitor<TreeVisitor> {
 public:
 
-    explicit TreeVisitor(ASTContext* Context) : Context(Context) {}
+    explicit TreeVisitor(ASTContext* Context, ProgramInfo& PI) : Context(Context), PI(PI) {}
 
-    bool VisitStmt(Stmt* s) {
+    bool VisitGotoStmt(GotoStmt* gs) {
 
         SourceManager& SM = Context->getSourceManager();
 
-        if (!SM.isInSystemHeader(s->getBeginLoc())) {
-            GotoChecker(s, SM);
+        if (!SM.isInSystemHeader(gs->getBeginLoc())) {
+            llvm::outs() << "-> Rule 1 Violation: Goto statement used in " << SM.getFilename(gs->getBeginLoc()) << " at line " << SM.getSpellingLineNumber(gs->getBeginLoc()) << "\n";
+            ++PI.Violations;
         }
 
         return true;
@@ -37,19 +45,58 @@ public:
         SourceManager& SM = Context->getSourceManager();
 
         if (!SM.isInSystemHeader(fd->getBeginLoc())) {
-            FunctionLengthChecker(fd, SM);
+
+            if (fd->hasBody()) {
+                ++PI.FunctionCount;
+                FunctionLengthChecker(fd, SM);
+            }
         }
 
         return true;
     }
 
-    bool VisitStaticAssertDecl(StaticAssertDecl *D) {
+    bool VisitStaticAssertDecl(StaticAssertDecl *sad) {
 
-        SourceManager &SM = Context->getSourceManager();
+        SourceManager& SM = Context->getSourceManager();
 
-        if (!SM.isInSystemHeader(D->getBeginLoc())) {
-            llvm::outs() << "static_assert in "
-                << SM.getFilename(D->getBeginLoc()) << "\n";
+        if (!SM.isInSystemHeader(sad->getBeginLoc())) {
+            ++PI.AssertionCount;
+        }
+
+        return true;
+    }
+
+    bool VisitForStmt(ForStmt* fs) {
+        
+        SourceManager& SM = Context->getSourceManager();
+
+        if (!SM.isInSystemHeader(fs->getBeginLoc())) {
+            //BoundedLoopChecker(fs, SM);
+        }
+
+        return true;
+    }
+
+    bool VisitWhileStmt(WhileStmt* ws) {
+        
+        SourceManager& SM = Context->getSourceManager();
+
+        if (!SM.isInSystemHeader(ws->getBeginLoc())) {
+            //BoundedLoopChecker(ws, SM);
+        }
+
+        return true;
+    }
+
+    bool VisitUnaryOperator(UnaryOperator* uo) {
+
+        SourceManager& SM = Context->getSourceManager();
+
+        if (!SM.isInSystemHeader(uo->getBeginLoc())) {
+            
+            if (uo->getOpcode() == UO_Deref) {
+                MDC(uo, SM);
+            }
         }
 
         return true;
@@ -67,9 +114,9 @@ public:
             return true;
         }
 
-        FunctionStack.push_back(fd);
+        PI.FunctionStack.push_back(fd);
         RecursiveASTVisitor::TraverseFunctionDecl(fd);
-        FunctionStack.pop_back();
+        PI.FunctionStack.pop_back();
 
         return true;
     }
@@ -77,20 +124,7 @@ public:
 private:
 
     ASTContext* Context;
-    std::vector<FunctionDecl*> FunctionStack;
-
-    void GotoChecker(Stmt* s, SourceManager& SM) {
-        
-        if (!s) {
-            return;
-        }
-
-        if (isa<GotoStmt>(s)) {
-            llvm::outs() << "-> Rule 1 Violation: Goto statement used in " << SM.getFilename(s->getBeginLoc()) << " at line " << SM.getSpellingLineNumber(s->getBeginLoc()) << "\n";
-            ++violations;
-        }
-    }
-
+    ProgramInfo& PI;
 
     void FunctionCallDetector(CallExpr* expr, SourceManager& SM) {
         
@@ -104,16 +138,16 @@ private:
 
         if (CalledFunctionName == "setjmp") {
             llvm::outs() << "-> Rule 1 Violation: 'setjmp' use in " << SM.getFilename(expr->getBeginLoc()) << " at line " << SM.getSpellingLineNumber(expr->getBeginLoc()) << "\n";
-            ++violations;
+            ++PI.Violations;
         }
         if (CalledFunctionName == "longjmp") {
             llvm::outs() << "-> Rule 1 Violation: 'longjmp' use in " << SM.getFilename(expr->getBeginLoc()) << " at line " << SM.getSpellingLineNumber(expr->getBeginLoc()) << "\n";
-            ++violations;
+            ++PI.Violations;
         }
 
-        if (!FunctionStack.empty()) {
+        if (!PI.FunctionStack.empty()) {
 
-            FunctionDecl* CurrentFunction = FunctionStack.back();
+            FunctionDecl* CurrentFunction = PI.FunctionStack.back();
 
             if (CalledFunction == CurrentFunction) {
                 llvm::outs()
@@ -124,39 +158,32 @@ private:
                     << SM.getSpellingLineNumber(expr->getBeginLoc())
                     << "\n";
 
-                ++violations;
+                ++PI.Violations;
             }
         }
 
         if (CalledFunctionName == "malloc") {
             llvm::outs() << "-> Rule 3 Violation: 'malloc' use in " << SM.getFilename(expr->getBeginLoc()) << " at line " << SM.getSpellingLineNumber(expr->getBeginLoc()) << "\n";
-            ++violations;
+            ++PI.Violations;
         }
         if (CalledFunctionName == "calloc") {
             llvm::outs() << "-> Rule 3 Violation: 'calloc' use in " << SM.getFilename(expr->getBeginLoc()) << " at line " << SM.getSpellingLineNumber(expr->getBeginLoc()) << "\n";
-            ++violations;
+            ++PI.Violations;
         }
         if (CalledFunctionName == "realloc") {
             llvm::outs() << "-> Rule 3 Violation: 'realloc' use in " << SM.getFilename(expr->getBeginLoc()) << " at line " << SM.getSpellingLineNumber(expr->getBeginLoc()) << "\n";
-            ++violations;
-        }
-
-        if (CalledFunctionName == "assert") {
-            llvm::outs() << "-> Assert Spotted!" << "\n";
-        }
-        if (CalledFunctionName == "static_assert") {
-            llvm::outs() << "-> Static Assert Spotted!" << "\n";
+            ++PI.Violations;
         }
     }
 
 
     void RecursionDetector(CallExpr* expr, SourceManager& SM) {
 
-        if (FunctionStack.empty()) {
+        if (PI.FunctionStack.empty()) {
             return;
         }
 
-        FunctionDecl* CurrentFunction = FunctionStack.back();
+        FunctionDecl* CurrentFunction = PI.FunctionStack.back();
         FunctionDecl* CalledFunction = expr->getDirectCallee();
 
         if (!CalledFunction) {
@@ -172,7 +199,7 @@ private:
                 << SM.getSpellingLineNumber(expr->getBeginLoc())
                 << "\n";
 
-            ++violations;
+            ++PI.Violations;
         }
     }
 
@@ -189,33 +216,119 @@ private:
 
         if (FunctionName == "malloc") {
             llvm::outs() << "-> Rule 3 Violation: 'malloc' use in " << SM.getFilename(expr->getBeginLoc()) << " at line " << SM.getSpellingLineNumber(expr->getBeginLoc()) << "\n";
-            ++violations;
+            ++PI.Violations;
         }
         if (FunctionName == "calloc") {
             llvm::outs() << "-> Rule 3 Violation: 'calloc' use in " << SM.getFilename(expr->getBeginLoc()) << " at line " << SM.getSpellingLineNumber(expr->getBeginLoc()) << "\n";
-            ++violations;
+            ++PI.Violations;
         }
         if (FunctionName == "realloc") {
             llvm::outs() << "-> Rule 3 Violation: 'realloc' use in " << SM.getFilename(expr->getBeginLoc()) << " at line " << SM.getSpellingLineNumber(expr->getBeginLoc()) << "\n";
-            ++violations;
+            ++PI.Violations;
         }
     }
 
     
     void FunctionLengthChecker(FunctionDecl* fd, SourceManager& SM) {
         
-        if (!fd->hasBody()) {
-            return;
-        }
-
         Stmt* body = fd->getBody();
-        unsigned int start = SM.getSpellingLineNumber(body->getBeginLoc());
-        unsigned int end = SM.getSpellingLineNumber(body->getEndLoc());
+        auto start = SM.getSpellingLineNumber(body->getBeginLoc());
+        auto end = SM.getSpellingLineNumber(body->getEndLoc());
         
         if ((end - start + 1) > 60) {
             llvm::outs() << "-> Rule 4 Violation: Function '" << fd->getNameAsString() << "' in " << SM.getFilename(fd->getBeginLoc()) << " is longer than 60 lines of code \n";
-            ++violations;
+            ++PI.Violations;
         }
+    }
+
+
+    template<typename T>
+    void BoundedLoopChecker(T* stmt, SourceManager& SM) {
+
+        Expr* condition = stmt->getCond()->IgnoreParenImpCasts();
+
+        if (isa<ForStmt>(stmt)) {
+            
+            BinaryOperator* bo = dyn_cast<BinaryOperator>(condition);
+
+            if (!bo || !bo->isComparisonOp()) {
+                llvm::outs() << "-> Rule 2 Violation: For loop in "
+                    << SM.getFilename(stmt->getBeginLoc())
+                    << " at line "
+                    << SM.getSpellingLineNumber(stmt->getBeginLoc())
+                    << " is unbound";
+                ++PI.Violations;
+                return;
+            }
+
+            Expr* left = bo->getLHS()->IgnoreParenImpCasts();
+            Expr* right = bo->getRHS()->IgnoreParenImpCasts();
+        }
+
+
+        if (isa<WhileStmt>(stmt)) {
+            //
+        }
+    }
+
+    void MultipleDereferenceChecker(UnaryOperator* uo, SourceManager& SM) {
+
+        Expr* next = uo->getSubExpr()->IgnoreParenImpCasts();
+
+        if (!isa<UnaryOperator>(next)) {
+            return;
+        }
+
+        UnaryOperator* sub = static_cast<UnaryOperator*>(next);
+
+        if (sub->getOpcode() == UO_Deref) {
+            llvm::outs() << "-> Rule 9 Violation: Multiple dereference in "
+                << SM.getFilename(uo->getBeginLoc())
+                << " at line "
+                << SM.getSpellingLineNumber(uo->getBeginLoc())
+                << "\n";
+            ++PI.Violations;
+        }
+
+        return;
+    }
+
+    void MDC(UnaryOperator* uo, SourceManager& SM) {
+
+        Expr* next = uo->getSubExpr()->IgnoreParenImpCasts();
+
+        if (!isa<UnaryOperator>(next)) {
+            return;
+        }
+
+        UnaryOperator* sub = static_cast<UnaryOperator*>(next);
+
+        if (sub->getOpcode() != UO_Deref) {
+            return;
+        }
+
+        bool outmost = true;
+        for (const auto& parent : Context->getParents(*uo)) {
+
+            if (const auto* p = parent.get<UnaryOperator>()) {
+                
+                if (p->getOpcode() == UO_Deref) {
+                    outmost = false;
+                    break;
+                }
+            }
+        }
+
+        if (outmost == true) {
+            llvm::outs() << "-> Rule 9 Violation: Multiple dereference in "
+                << SM.getFilename(uo->getBeginLoc())
+                << " at line "
+                << SM.getSpellingLineNumber(uo->getBeginLoc())
+                << "\n";
+            ++PI.Violations;
+        }
+
+        return;
     }
 };
 
@@ -227,8 +340,8 @@ Everything below here is boilerplate
 
 class NewASTConsumer : public ASTConsumer {
 public:
-    explicit NewASTConsumer(ASTContext* Context)
-        : Visitor(Context) {}
+    explicit NewASTConsumer(ASTContext* Context, ProgramInfo& PI)
+        : Visitor(Context, PI) {}
 
     void HandleTranslationUnit(ASTContext& Context) override {
         Visitor.TraverseDecl(Context.getTranslationUnitDecl());
@@ -241,10 +354,14 @@ private:
 
 class NewFrontendAction : public ASTFrontendAction {
 public:
+    explicit NewFrontendAction(ProgramInfo& PI)
+        : PI(PI) {}
     std::unique_ptr<ASTConsumer>
         CreateASTConsumer(CompilerInstance& CI, StringRef) override {
-        return std::make_unique<NewASTConsumer>(&CI.getASTContext());
+        return std::make_unique<NewASTConsumer>(&CI.getASTContext(), PI);
     }
+private:
+    ProgramInfo& PI;
 };
 
 
@@ -259,25 +376,31 @@ int main(int argc, const char** argv) {
 
     llvm::outs() << "Trying to open: " << filepath << "\n";
 
-    std::ifstream t(filepath);
-    if (!t) {
+    std::ifstream filestream(filepath);
+    if (!filestream) {
         llvm::errs() << "Failed to open file: " << filepath << "\n";
         return 1;
     }
 
-    std::string code((std::istreambuf_iterator<char>(t)),
-        std::istreambuf_iterator<char>());
-
+    std::string code((std::istreambuf_iterator<char>(filestream)), std::istreambuf_iterator<char>());
     std::vector<std::string> args = { "-std=c++17", "-w"};
+    ProgramInfo PI;
 
     runToolOnCodeWithArgs(
-        std::make_unique<NewFrontendAction>(),
+        std::make_unique<NewFrontendAction>(PI),
         code,
         args,
         filepath
     );
 
-    llvm::outs() << "Total violations detected: " << violations << "\n";
+    if (PI.AssertionCount / PI.FunctionCount <= 2) {
+        llvm::outs() << "-> Rule 5 Violation: Assertion Density less than 2 assertions per function. Functions - " << PI.FunctionCount << ", Assertions - " << PI.AssertionCount << "\n";
+        ++PI.Violations;
+    }
 
+    llvm::outs() << "Total violations detected: " << PI.Violations << "\n";
+    llvm::outs() << "Functions: " << PI.FunctionCount << "\n";
+    llvm::outs() << "Assertions: " << PI.AssertionCount << "\n";
+    
     return 0;
 }
