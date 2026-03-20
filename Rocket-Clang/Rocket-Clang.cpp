@@ -3,6 +3,13 @@
 using namespace clang;
 using namespace clang::tooling;
 
+struct VariableInfo {
+    std::string VariableName;
+    const unsigned int SourceLine;
+    const unsigned int DeclarationDepth;
+    int ShallowestReferenceDepth;
+};
+
 struct ProgramInfo {
     std::vector<FunctionDecl*> FunctionStack;
     int FunctionCount = 0;
@@ -10,6 +17,9 @@ struct ProgramInfo {
     int Violations = 0;
     int DereferenceCount = 0;
     bool MultipleDereference = false;
+    std::vector<std::tuple<llvm::StringRef, unsigned int, unsigned int>> OutmostDerefs;
+    std::unordered_map<VarDecl*, VariableInfo> VariableDepthMap{};
+    unsigned int CurrentDepth = 0;
 };
 
 class TreeVisitor : public RecursiveASTVisitor<TreeVisitor> {
@@ -35,6 +45,7 @@ public:
 
         if (!SM.isInSystemHeader(expr->getBeginLoc())) {
             FunctionCallDetector(expr, SM);
+            FunctionReturnCheck(expr, SM);
         }
 
         return true;
@@ -95,8 +106,53 @@ public:
         if (!SM.isInSystemHeader(uo->getBeginLoc())) {
             
             if (uo->getOpcode() == UO_Deref) {
-                MDC(uo, SM);
+                MultipleDereferenceChecker(uo, SM);
             }
+        }
+
+        return true;
+    }
+
+    bool VisitVarDecl(VarDecl* vd) {
+
+        SourceManager& SM = Context->getSourceManager();
+
+        if (!SM.isInSystemHeader(vd->getBeginLoc())) {
+            FunctionPointerChecker(vd, SM);
+            VarDepthHandler(vd, SM);
+        }
+
+        return true;
+    }
+
+    bool VisitParmVarDecl(ParmVarDecl* pvd) {
+
+        SourceManager& SM = Context->getSourceManager();
+
+        if (!SM.isInSystemHeader(pvd->getBeginLoc())) {
+            FunctionPointerChecker(pvd, SM);
+        }
+
+        return true;
+    }
+
+    bool VisitFieldDecl(FieldDecl* fd) {
+
+        SourceManager& SM = Context->getSourceManager();
+
+        if (!SM.isInSystemHeader(fd->getBeginLoc())) {
+            FunctionPointerChecker(fd, SM);
+        }
+
+        return true;
+    }
+
+    bool VisitDeclRefExpr(DeclRefExpr* dre) {
+
+        SourceManager& SM = Context->getSourceManager();
+
+        if (!SM.isInSystemHeader(dre->getBeginLoc())) {
+            DeclRefExprHandler(dre, SM);
         }
 
         return true;
@@ -114,9 +170,20 @@ public:
             return true;
         }
 
-        PI.FunctionStack.push_back(fd);
+        PI.FunctionStack.push_back(fd->getCanonicalDecl());
         RecursiveASTVisitor::TraverseFunctionDecl(fd);
         PI.FunctionStack.pop_back();
+
+        return true;
+    }
+
+    bool TraverseCompoundStmt(CompoundStmt* cs) {
+
+        SourceManager& SM = Context->getSourceManager();
+
+        ++PI.CurrentDepth;
+        RecursiveASTVisitor::TraverseCompoundStmt(cs);
+        --PI.CurrentDepth;
 
         return true;
     }
@@ -128,7 +195,7 @@ private:
 
     void FunctionCallDetector(CallExpr* expr, SourceManager& SM) {
         
-        FunctionDecl* CalledFunction = expr->getDirectCallee();
+        FunctionDecl* CalledFunction = expr->getDirectCallee()->getCanonicalDecl();
 
         if (!CalledFunction) {
             return;
@@ -136,10 +203,6 @@ private:
 
         std::string CalledFunctionName = CalledFunction->getNameAsString();
 
-        if (CalledFunctionName == "setjmp") {
-            llvm::outs() << "-> Rule 1 Violation: 'setjmp' use in " << SM.getFilename(expr->getBeginLoc()) << " at line " << SM.getSpellingLineNumber(expr->getBeginLoc()) << "\n";
-            ++PI.Violations;
-        }
         if (CalledFunctionName == "longjmp") {
             llvm::outs() << "-> Rule 1 Violation: 'longjmp' use in " << SM.getFilename(expr->getBeginLoc()) << " at line " << SM.getSpellingLineNumber(expr->getBeginLoc()) << "\n";
             ++PI.Violations;
@@ -153,12 +216,30 @@ private:
                 llvm::outs()
                     << "-> Rule 1 Violation: Recursion found in function '"
                     << CurrentFunction->getNameAsString()
-                    << "' in " << SM.getFilename(expr->getBeginLoc())
+                    << "' calls itself in " << SM.getFilename(expr->getBeginLoc())
                     << " at line "
                     << SM.getSpellingLineNumber(expr->getBeginLoc())
                     << "\n";
 
                 ++PI.Violations;
+            }
+
+            for (const auto* f : PI.FunctionStack) {
+                
+                if (CalledFunction == f && CalledFunction != CurrentFunction) {
+                    llvm::outs()
+                        << "-> Rule 1 Violation: Recursion (Indirect) found in function '"
+                        << CurrentFunction->getNameAsString()
+                        << "' calls function '" << f->getNameAsString()
+                        << "' in "
+                        << SM.getFilename(expr->getBeginLoc())
+                        << " at line "
+                        << SM.getSpellingLineNumber(expr->getBeginLoc())
+                        << "\n";
+
+                    ++PI.Violations;
+                    break;
+                }
             }
         }
 
@@ -174,61 +255,13 @@ private:
             llvm::outs() << "-> Rule 3 Violation: 'realloc' use in " << SM.getFilename(expr->getBeginLoc()) << " at line " << SM.getSpellingLineNumber(expr->getBeginLoc()) << "\n";
             ++PI.Violations;
         }
-    }
-
-
-    void RecursionDetector(CallExpr* expr, SourceManager& SM) {
-
-        if (PI.FunctionStack.empty()) {
-            return;
-        }
-
-        FunctionDecl* CurrentFunction = PI.FunctionStack.back();
-        FunctionDecl* CalledFunction = expr->getDirectCallee();
-
-        if (!CalledFunction) {
-            return;
-        }
-
-        if (CalledFunction == CurrentFunction) {
-            llvm::outs()
-                << "-> Rule 1 Violation: Recursion found in function '"
-                << CurrentFunction->getNameAsString()
-                << "' in " << SM.getFilename(expr->getBeginLoc())
-                << " at line "
-                << SM.getSpellingLineNumber(expr->getBeginLoc())
-                << "\n";
-
+        if (CalledFunctionName == "aligned_alloc") {
+            llvm::outs() << "-> Rule 3 Violation: 'aligned_alloc' use in " << SM.getFilename(expr->getBeginLoc()) << " at line " << SM.getSpellingLineNumber(expr->getBeginLoc()) << "\n";
             ++PI.Violations;
         }
     }
 
 
-    void DynamicMemoryAfterInit(CallExpr* expr, SourceManager& SM) {
-        
-        FunctionDecl* CalledFunction = expr->getDirectCallee();
-
-        if (!CalledFunction) {
-            return;
-        }
-
-        std::string FunctionName = CalledFunction->getNameAsString();
-
-        if (FunctionName == "malloc") {
-            llvm::outs() << "-> Rule 3 Violation: 'malloc' use in " << SM.getFilename(expr->getBeginLoc()) << " at line " << SM.getSpellingLineNumber(expr->getBeginLoc()) << "\n";
-            ++PI.Violations;
-        }
-        if (FunctionName == "calloc") {
-            llvm::outs() << "-> Rule 3 Violation: 'calloc' use in " << SM.getFilename(expr->getBeginLoc()) << " at line " << SM.getSpellingLineNumber(expr->getBeginLoc()) << "\n";
-            ++PI.Violations;
-        }
-        if (FunctionName == "realloc") {
-            llvm::outs() << "-> Rule 3 Violation: 'realloc' use in " << SM.getFilename(expr->getBeginLoc()) << " at line " << SM.getSpellingLineNumber(expr->getBeginLoc()) << "\n";
-            ++PI.Violations;
-        }
-    }
-
-    
     void FunctionLengthChecker(FunctionDecl* fd, SourceManager& SM) {
         
         Stmt* body = fd->getBody();
@@ -239,6 +272,27 @@ private:
             llvm::outs() << "-> Rule 4 Violation: Function '" << fd->getNameAsString() << "' in " << SM.getFilename(fd->getBeginLoc()) << " is longer than 60 lines of code \n";
             ++PI.Violations;
         }
+    }
+
+
+    void FunctionReturnCheck(CallExpr* ce, SourceManager& SM) {
+
+        const Expr* WarnExpr = nullptr;
+        SourceLocation Loc;
+        SourceRange R1;
+        SourceRange R2;
+
+        if (ce->isUnusedResultAWarning(WarnExpr, Loc, R1, R2, *Context))
+        {
+            llvm::outs() << "Rule 7 Violation: Return value ignored in "
+                << SM.getFilename(ce->getBeginLoc())
+                << " at line "
+                << SM.getSpellingLineNumber(ce->getBeginLoc())
+                << "\n";
+            ++PI.Violations;
+        }
+
+        return;
     }
 
 
@@ -271,6 +325,47 @@ private:
         }
     }
 
+
+    template<typename T>
+    void FunctionPointerChecker(T* type, SourceManager& SM) {
+
+        auto IsFunctionPointer = [](QualType qt) {
+            qt = qt.getCanonicalType();
+
+            if (const auto* pt = qt->getAs<PointerType>()) {
+
+                if (pt->getPointeeType()->isFunctionType()) {
+                    return true;
+                }
+            }
+
+            if (qt->isMemberFunctionPointerType()) {
+                return true;
+            }
+
+            return false;
+            };
+
+        QualType qt;
+
+        if constexpr (std::is_same<T, ParmVarDecl>::value) {
+            qt = type->getOriginalType();
+        }
+        else {
+            qt = type->getType();
+        }
+
+        if (IsFunctionPointer(qt)) {
+            llvm::outs() << "-> Rule 9 Violation: Function pointer in "
+                << SM.getFilename(type->getBeginLoc())
+                << " at line "
+                << SM.getSpellingLineNumber(type->getBeginLoc())
+                << "\n";
+            ++PI.Violations;
+        }
+    }
+
+
     void MultipleDereferenceChecker(UnaryOperator* uo, SourceManager& SM) {
 
         Expr* next = uo->getSubExpr()->IgnoreParenImpCasts();
@@ -293,39 +388,40 @@ private:
         return;
     }
 
-    void MDC(UnaryOperator* uo, SourceManager& SM) {
 
-        Expr* next = uo->getSubExpr()->IgnoreParenImpCasts();
+    void VarDepthHandler(VarDecl* vd, SourceManager& SM) {
 
-        if (!isa<UnaryOperator>(next)) {
+        if (isa<ParmVarDecl>(vd) || vd->hasGlobalStorage()) {
             return;
         }
 
-        UnaryOperator* sub = static_cast<UnaryOperator*>(next);
+        VariableInfo vi = {vd->getNameAsString(), SM.getSpellingLineNumber(vd->getBeginLoc()), PI.CurrentDepth, -1};
 
-        if (sub->getOpcode() != UO_Deref) {
-            return;
+        auto result = PI.VariableDepthMap.insert({vd, vi});
+
+        if (!result.second) {
+            llvm::outs() << "Key already existed\n";
         }
 
-        bool outmost = true;
-        for (const auto& parent : Context->getParents(*uo)) {
+        return;
+    }
 
-            if (const auto* p = parent.get<UnaryOperator>()) {
-                
-                if (p->getOpcode() == UO_Deref) {
-                    outmost = false;
-                    break;
+
+    void DeclRefExprHandler(DeclRefExpr* dre, SourceManager& SM) {
+
+        if (VarDecl* vd = dyn_cast<VarDecl>(dre->getDecl())) {
+            
+            auto iterator = PI.VariableDepthMap.find(vd);
+
+            if (iterator != PI.VariableDepthMap.end()) {
+
+                auto& vi = iterator->second;
+
+                if (vi.ShallowestReferenceDepth == -1) { vi.ShallowestReferenceDepth = PI.CurrentDepth; }
+                else {
+                    if (PI.CurrentDepth < vi.ShallowestReferenceDepth) { vi.ShallowestReferenceDepth = PI.CurrentDepth; }
                 }
             }
-        }
-
-        if (outmost == true) {
-            llvm::outs() << "-> Rule 9 Violation: Multiple dereference in "
-                << SM.getFilename(uo->getBeginLoc())
-                << " at line "
-                << SM.getSpellingLineNumber(uo->getBeginLoc())
-                << "\n";
-            ++PI.Violations;
         }
 
         return;
@@ -383,7 +479,7 @@ int main(int argc, const char** argv) {
     }
 
     std::string code((std::istreambuf_iterator<char>(filestream)), std::istreambuf_iterator<char>());
-    std::vector<std::string> args = { "-std=c++17", "-w"};
+    std::vector<std::string> args = { "-std=c++17", "-w" };
     ProgramInfo PI;
 
     runToolOnCodeWithArgs(
@@ -398,9 +494,20 @@ int main(int argc, const char** argv) {
         ++PI.Violations;
     }
 
+    for (const auto& variable : PI.VariableDepthMap) {
+
+        const auto& vi = variable.second;
+
+        if (vi.ShallowestReferenceDepth != -1 && vi.ShallowestReferenceDepth > vi.DeclarationDepth) {
+            llvm::outs() << "-> Rule 6 Violation:"
+                << " Variable " << vi.VariableName << " is defined at depth " << vi.DeclarationDepth
+                << ", but it's shallowest reference is " << vi.ShallowestReferenceDepth
+                << ", variable is not declared at lowest possible scope\n";
+            ++PI.Violations;
+        }
+    }
+
     llvm::outs() << "Total violations detected: " << PI.Violations << "\n";
-    llvm::outs() << "Functions: " << PI.FunctionCount << "\n";
-    llvm::outs() << "Assertions: " << PI.AssertionCount << "\n";
-    
+
     return 0;
 }
