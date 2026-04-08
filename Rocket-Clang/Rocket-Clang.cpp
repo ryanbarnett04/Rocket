@@ -39,13 +39,14 @@ public:
         return true;
     }
 
-    bool VisitCallExpr(CallExpr* expr) {
+    bool VisitCallExpr(CallExpr* ce) {
 
         SourceManager& SM = Context->getSourceManager();
 
-        if (!SM.isInSystemHeader(expr->getBeginLoc())) {
-            FunctionCallDetector(expr, SM);
-            FunctionReturnCheck(expr, SM);
+        if (!SM.isInSystemHeader(ce->getBeginLoc())) {
+
+            FunctionCallDetector(ce, SM);
+            FunctionReturnCheck(ce, SM);
         }
 
         return true;
@@ -82,7 +83,19 @@ public:
         SourceManager& SM = Context->getSourceManager();
 
         if (!SM.isInSystemHeader(fs->getBeginLoc())) {
-            //BoundedLoopChecker(fs, SM);
+            const auto* cond = fs->getCond();
+
+            if (!cond) {
+                llvm::outs() << "-> Rule 2 Violation: For loop unbounded in "
+                    << SM.getFilename(fs->getBeginLoc())
+                    << " at line "
+                    << SM.getSpellingLineNumber(fs->getBeginLoc())
+                    << "\n";
+                ++PI.Violations;
+                return true;
+            }
+
+            BoundedLoopChecker(fs->getCond(), SM);
         }
 
         return true;
@@ -93,7 +106,18 @@ public:
         SourceManager& SM = Context->getSourceManager();
 
         if (!SM.isInSystemHeader(ws->getBeginLoc())) {
-            //BoundedLoopChecker(ws, SM);
+            BoundedLoopChecker(ws->getCond(), SM);
+        }
+
+        return true;
+    }
+
+    bool VisitDoStmt(DoStmt* ds) {
+
+        SourceManager& SM = Context->getSourceManager();
+
+        if (!SM.isInSystemHeader(ds->getBeginLoc())) {
+            BoundedLoopChecker(ds->getCond(), SM);
         }
 
         return true;
@@ -195,11 +219,13 @@ private:
 
     void FunctionCallDetector(CallExpr* expr, SourceManager& SM) {
         
-        FunctionDecl* CalledFunction = expr->getDirectCallee()->getCanonicalDecl();
+        FunctionDecl* CalledFunction = expr->getDirectCallee();
 
         if (!CalledFunction) {
             return;
         }
+
+        CalledFunction = CalledFunction->getCanonicalDecl();
 
         std::string CalledFunctionName = CalledFunction->getNameAsString();
 
@@ -272,57 +298,130 @@ private:
             llvm::outs() << "-> Rule 4 Violation: Function '" << fd->getNameAsString() << "' in " << SM.getFilename(fd->getBeginLoc()) << " is longer than 60 lines of code \n";
             ++PI.Violations;
         }
+
+        return;
     }
 
 
     void FunctionReturnCheck(CallExpr* ce, SourceManager& SM) {
 
-        const Expr* WarnExpr = nullptr;
-        SourceLocation Loc;
-        SourceRange R1;
-        SourceRange R2;
+        QualType qt = ce->getCallReturnType(*Context);
 
-        if (ce->isUnusedResultAWarning(WarnExpr, Loc, R1, R2, *Context))
-        {
-            llvm::outs() << "Rule 7 Violation: Return value ignored in "
-                << SM.getFilename(ce->getBeginLoc())
-                << " at line "
-                << SM.getSpellingLineNumber(ce->getBeginLoc())
-                << "\n";
-            ++PI.Violations;
+        if (qt->isVoidType() || qt->isReferenceType()) {
+            return;
+        }
+
+        const Stmt* CurrentNode = ce;
+
+        while (true) {
+
+            auto parents = Context->getParents(*CurrentNode);
+            if (parents.empty()) return;
+
+            const Stmt* parent = parents[0].get<Stmt>();
+            if (!parent) return;
+
+            if (isa<CompoundStmt>(parent)) break;
+
+            if (auto csce = dyn_cast<CStyleCastExpr>(parent))
+                if (csce->getCastKind() == CK_ToVoid)
+                    return;
+
+            if (!isa<ImplicitCastExpr>(parent) &&
+                !isa<ParenExpr>(parent) &&
+                !isa<ExprWithCleanups>(parent) &&
+                !isa<CXXBindTemporaryExpr>(parent) &&
+                !isa<MaterializeTemporaryExpr>(parent) &&
+                !isa<SubstNonTypeTemplateParmExpr>(parent))
+                return;
+
+            CurrentNode = parent;
+        }
+
+        std::string name;
+        if (auto* FD = dyn_cast<FunctionDecl>(ce->getCalleeDecl())) {
+            name = FD->getNameAsString();
+        }
+        else { name = "unknown"; }
+
+        llvm::outs() << "-> Rule 7 Violation: Function return value ignored in "
+            << SM.getFilename(ce->getBeginLoc())
+            << " for call to function '"
+            << name
+            << "' at line "
+            << SM.getSpellingLineNumber(ce->getBeginLoc())
+            << "\n";
+        ++PI.Violations;
+        return;
+    }
+
+
+    void BoundedLoopChecker(Expr* expr, SourceManager& SM) {
+
+        Expr::EvalResult er1;
+        if (expr->EvaluateAsConstantExpr(er1, *Context)) {
+            if (er1.Val.getInt().getBoolValue()) {
+                llvm::outs() << "-> Rule 2 Violation: Loop has always true condition in "
+                    << SM.getFilename(expr->getBeginLoc())
+                    << " at line "
+                    << SM.getSpellingLineNumber(expr->getBeginLoc())
+                    << "\n";
+                ++PI.Violations;
+                return;
+            }
+        }
+
+        Expr::EvalResult er2;
+        if (expr->EvaluateAsRValue(er2, *Context)) { return; }
+
+        if (const auto* bo = dyn_cast<BinaryOperator>(expr)) {
+            if (bo->isComparisonOp()) {
+
+                auto left = bo->getLHS();
+                auto right = bo->getRHS();
+                bool result = ProvablyBound(left) || ProvablyBound(right);
+
+                if (!result) {
+                    llvm::outs() << "-> Rule 2 Violation: Cannot trivially and statically prove loop is bounded in "
+                        << SM.getFilename(expr->getBeginLoc())
+                        << " at line "
+                        << SM.getSpellingLineNumber(expr->getBeginLoc())
+                        << "\n";
+                    ++PI.Violations;
+                }
+            }
         }
 
         return;
     }
 
 
-    template<typename T>
-    void BoundedLoopChecker(T* stmt, SourceManager& SM) {
+    bool ProvablyBound(const Expr* expr) {
 
-        Expr* condition = stmt->getCond()->IgnoreParenImpCasts();
+        if (!expr) { return false; }
+        expr = expr->IgnoreParenImpCasts();
+        if (isa<IntegerLiteral>(expr)) { return true; }
 
-        if (isa<ForStmt>(stmt)) {
-            
-            BinaryOperator* bo = dyn_cast<BinaryOperator>(condition);
+        if (isa<DeclRefExpr>(expr)) {
+            auto* dfe = dyn_cast<DeclRefExpr>(expr);
+            const ValueDecl* vld = dfe->getDecl();
+            if (isa<EnumConstantDecl>(vld)) { return true; }
 
-            if (!bo || !bo->isComparisonOp()) {
-                llvm::outs() << "-> Rule 2 Violation: For loop in "
-                    << SM.getFilename(stmt->getBeginLoc())
-                    << " at line "
-                    << SM.getSpellingLineNumber(stmt->getBeginLoc())
-                    << " is unbound";
-                ++PI.Violations;
-                return;
+            if (auto* vd = dyn_cast<VarDecl>(vld)) {
+                if (vd->getType().isConstQualified() && vd->hasInit()) {
+                    return ProvablyBound(vd->getInit());
+                }
             }
-
-            Expr* left = bo->getLHS()->IgnoreParenImpCasts();
-            Expr* right = bo->getRHS()->IgnoreParenImpCasts();
         }
 
-
-        if (isa<WhileStmt>(stmt)) {
-            //
+        if (auto* bo = dyn_cast<BinaryOperator>(expr)) {
+            auto left = bo->getLHS();
+            auto right = bo->getRHS();
+            return ProvablyBound(left) && ProvablyBound(right);
         }
+
+        Expr::EvalResult er;
+        return expr->EvaluateAsConstantExpr(er, *Context);
     }
 
 
@@ -463,6 +562,8 @@ private:
 
 int main(int argc, const char** argv) {
 
+    auto start = std::chrono::high_resolution_clock::now();
+
     if (argc < 2) {
         llvm::errs() << "Usage: RocketClang.exe <file>\n";
         return 1;
@@ -479,7 +580,7 @@ int main(int argc, const char** argv) {
     }
 
     std::string code((std::istreambuf_iterator<char>(filestream)), std::istreambuf_iterator<char>());
-    std::vector<std::string> args = { "-std=c++17", "-w" };
+    std::vector<std::string> args = { "-std=c++20", "-w", "-fsyntax-only"};
     ProgramInfo PI;
 
     runToolOnCodeWithArgs(
@@ -489,7 +590,7 @@ int main(int argc, const char** argv) {
         filepath
     );
 
-    if (PI.AssertionCount / PI.FunctionCount <= 2) {
+    if (PI.FunctionCount != 0 && PI.AssertionCount / PI.FunctionCount < 2) {
         llvm::outs() << "-> Rule 5 Violation: Assertion Density less than 2 assertions per function. Functions - " << PI.FunctionCount << ", Assertions - " << PI.AssertionCount << "\n";
         ++PI.Violations;
     }
@@ -508,6 +609,10 @@ int main(int argc, const char** argv) {
     }
 
     llvm::outs() << "Total violations detected: " << PI.Violations << "\n";
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    llvm::outs() << "Execution time: " << elapsed.count() << " seconds\n";
 
     return 0;
 }
